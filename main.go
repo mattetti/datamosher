@@ -41,6 +41,9 @@ func main() {
 	var iFrameTimes []float64
 	firstIFrameFound := false
 
+	dropPFrames := false
+	dropAllIFrames := true
+
 	for _, track := range parsedFile.Moov.Traks {
 		if track.Mdia.Hdlr.HandlerType == "vide" {
 			// This is a video track
@@ -50,28 +53,29 @@ func main() {
 
 			for i := 0; i < len(stbl.Stsz.SampleSize); i++ {
 				sampleNr := i + 1
-				// IDR frame
 				if stbl.Stss != nil {
+
+					t := getSampleTime(stbl, sampleNr)
+					time := float64(t) / timeScale
 
 					// i-frame
 					if stbl.Stss.IsSyncSample(uint32(sampleNr)) {
 						// get the frame time:
-						decTime, _ := stbl.Stts.GetDecodeTime(uint32(sampleNr))
-						var cto int32 = 0
-						if stbl.Ctts != nil {
-							cto = stbl.Ctts.GetCompositionTimeOffset(uint32(sampleNr))
-						}
-						time := float64(decTime+uint64(cto)) / timeScale
+
 						iFrameTimes = append(iFrameTimes, time)
 
 						if firstIFrameFound {
 							// Replace I-frame NAL unit data with null bytes
-							replaceNALUnitData(parsedFile, stbl, sampleNr, inputFile)
+							replaceNALUnitData(parsedFile, stbl, sampleNr, inputFile, dropAllIFrames)
 						} else {
 							firstIFrameFound = true
 						}
 					} else {
-						processNonIDRFrame(parsedFile, stbl, sampleNr, inputFile, timeScale)
+						if firstIFrameFound && time > 0.5 {
+							if dropPFrames {
+								processNonIDRFrame(parsedFile, stbl, sampleNr, inputFile, timeScale)
+							}
+						}
 					}
 
 				}
@@ -114,7 +118,7 @@ func getChunkOffset(stbl *mp4.StblBox, chunkNr int) int64 {
 }
 
 // replaceNALUnitData replaces the NAL unit data in the mdat box
-func replaceNALUnitData(parsedFile *mp4.File, stbl *mp4.StblBox, sampleNr int, rs io.ReadSeeker) error {
+func replaceNALUnitData(parsedFile *mp4.File, stbl *mp4.StblBox, sampleNr int, rs io.ReadSeeker, dropAllIFrames bool) error {
 
 	mdat := parsedFile.Mdat
 	mdatPayloadStart := mdat.PayloadAbsoluteOffset()
@@ -187,7 +191,7 @@ func replaceNALUnitData(parsedFile *mp4.File, stbl *mp4.StblBox, sampleNr int, r
 		}
 		err = printAVCNalus(avcSPS, nalus, sampleNr, pts)
 
-		nullifyIDR(nalus, mdat, offsetInMdatData, spsMap, ppsMap)
+		nullifyIDR(nalus, mdat, offsetInMdatData, dropAllIFrames, spsMap, ppsMap)
 
 	case "hevc", "h.265", "h265":
 		fmt.Println("HEVC not supported yet")
@@ -208,12 +212,15 @@ func getSampleTime(stbl *mp4.StblBox, sampleNr int) uint64 {
 	return decTime + uint64(cto)
 }
 
-func nullifyIDR(nalus [][]byte, mdat *mp4.MdatBox, offsetInMdat uint64,
+func nullifyIDR(nalus [][]byte, mdat *mp4.MdatBox, offsetInMdat uint64, dropAllIFrames bool,
 	spsMap map[uint32]*avc.SPS, ppsMap map[uint32]*avc.PPS) {
 	// Implement the nullifyIDR function here.
 	offset := 0
 	for _, nalu := range nalus {
-		sliceSize := len(nalu) + 4
+		rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+		randomInt := rnd.Intn(11)
+
+		sliceSize := len(nalu)
 		nType := avc.GetNaluType(nalu[0])
 		fmt.Println("Nalu type:", nType)
 		if nType == avc.NALU_IDR {
@@ -223,10 +230,14 @@ func nullifyIDR(nalus [][]byte, mdat *mp4.MdatBox, offsetInMdat uint64,
 			// 	panic(err)
 			// }
 			// fmt.Printf("Slice %#v\n", sliceHeader)
-			nullSlice := make([]byte, sliceSize)
-			naluOffsetInMdat := offsetInMdat + uint64(offset)
-			fmt.Println("Nullifying IDR NALU @", naluOffsetInMdat)
-			copy(mdat.Data[naluOffsetInMdat:offsetInMdat+uint64(sliceSize-4)], nullSlice)
+			if dropAllIFrames || randomInt > 5 {
+				nullSlice := make([]byte, sliceSize)
+				naluOffsetInMdat := offsetInMdat + uint64(offset)
+				fmt.Println("Nullifying IDR NALU @", naluOffsetInMdat)
+				copy(mdat.Data[naluOffsetInMdat+4:offsetInMdat+uint64(len(nullSlice))], nullSlice)
+			} else {
+				fmt.Println("Keeping IDR NALU")
+			}
 		} else if nType == avc.NALU_NON_IDR {
 			// sliceHeader, err := avc.ParseSliceHeader(nalu, spsMap, ppsMap)
 			// if err != nil {
@@ -234,12 +245,10 @@ func nullifyIDR(nalus [][]byte, mdat *mp4.MdatBox, offsetInMdat uint64,
 			// }
 			// fmt.Printf("Slice %#v\n", sliceHeader)
 		} else if nType == avc.NALU_SEI {
-			rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
-			randomInt := rnd.Intn(11)
-			if randomInt > 2 {
+			if dropAllIFrames || randomInt > 8 {
 				fmt.Println("Nullifying SEI NALU")
-				nullSlice := make([]byte, sliceSize)
-				copy(mdat.Data[offsetInMdat:offsetInMdat+uint64(sliceSize-4)], nullSlice)
+				nullSlice := make([]byte, sliceSize-4)
+				copy(mdat.Data[offsetInMdat+4:offsetInMdat+uint64(len(nullSlice))], nullSlice)
 			}
 		}
 	}
@@ -250,24 +259,6 @@ func processNonIDRFrame(parsedFile *mp4.File, stbl *mp4.StblBox, sampleNr int, r
 
 	mdat := parsedFile.Mdat
 	mdatPayloadStart := mdat.PayloadAbsoluteOffset()
-
-	// var avcSPS *avc.SPS
-	// var codec string
-
-	// if stbl.Stsd.AvcX != nil {
-	// 	codec = "avc"
-	// 	if stbl.Stsd.AvcX.AvcC != nil {
-	// 		avcSPS, err = avc.ParseSPSNALUnit(stbl.Stsd.AvcX.AvcC.SPSnalus[0], true)
-	// 		if err != nil {
-	// 			return fmt.Errorf("error parsing SPS: %s", err)
-	// 		}
-	// 	}
-	// } else if stbl.Stsd.HvcX != nil {
-	// 	codec = "hevc"
-	// }
-	// if codec != "avc" {
-	// 	return nil
-	// }
 
 	chunkNr, sampleNrAtChunkStart, err := stbl.Stsc.ChunkNrFromSampleNr(sampleNr)
 	if err != nil {
@@ -291,10 +282,10 @@ func processNonIDRFrame(parsedFile *mp4.File, stbl *mp4.StblBox, sampleNr int, r
 
 	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
 
+	offsetInMdat := offsetInMdatData
 	for _, nalu := range nalus {
-		var offsetInMdat uint64
 		naluType := avc.GetNaluType(nalu[0])
-		sliceSize := len(nalu) + 4
+		sliceSize := len(nalu)
 
 		if naluType == avc.NALU_NON_IDR {
 			sliceType, _ := avc.GetSliceTypeFromNALU(nalu)
@@ -302,11 +293,14 @@ func processNonIDRFrame(parsedFile *mp4.File, stbl *mp4.StblBox, sampleNr int, r
 			// Generate a random int between 0 and 10
 			randomInt := rnd.Intn(11)
 
+			if sliceType == avc.SLICE_B {
+				randomInt += 2
+			}
 			// If the random int is more than x, nullify the frame
-			if randomInt > 0 {
+			if randomInt > 8 {
 				fmt.Printf("Nullifying %s frame @ %.2f\n", sliceType, timeInSecs)
 				nullSlice := make([]byte, sliceSize)
-				copy(mdat.Data[offsetInMdat:offsetInMdat+uint64(sliceSize)], nullSlice)
+				copy(mdat.Data[offsetInMdat+4:offsetInMdat+uint64(len(nullSlice))], nullSlice)
 			} else {
 				fmt.Printf("%s frame pts: %.2f size: %d\n", sliceType, timeInSecs, len(nalu))
 			}
