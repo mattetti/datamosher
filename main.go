@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
+	"time"
 
 	"github.com/Eyevinn/mp4ff/avc"
 	"github.com/Eyevinn/mp4ff/mp4"
@@ -51,6 +53,7 @@ func main() {
 				// IDR frame
 				if stbl.Stss != nil {
 
+					// i-frame
 					if stbl.Stss.IsSyncSample(uint32(sampleNr)) {
 						// get the frame time:
 						decTime, _ := stbl.Stts.GetDecodeTime(uint32(sampleNr))
@@ -67,6 +70,8 @@ func main() {
 						} else {
 							firstIFrameFound = true
 						}
+					} else {
+						processNonIDRFrame(parsedFile, stbl, sampleNr, inputFile, timeScale)
 					}
 
 				}
@@ -111,7 +116,6 @@ func getChunkOffset(stbl *mp4.StblBox, chunkNr int) int64 {
 // replaceNALUnitData replaces the NAL unit data in the mdat box
 func replaceNALUnitData(parsedFile *mp4.File, stbl *mp4.StblBox, sampleNr int, rs io.ReadSeeker) error {
 
-	// nrSamples := stbl.Stsz.SampleNumber
 	mdat := parsedFile.Mdat
 	mdatPayloadStart := mdat.PayloadAbsoluteOffset()
 
@@ -140,11 +144,7 @@ func replaceNALUnitData(parsedFile *mp4.File, stbl *mp4.StblBox, sampleNr int, r
 		offset += int64(stbl.Stsz.GetSampleSize(sNr))
 	}
 	size := stbl.Stsz.GetSampleSize(sampleNr)
-	decTime, _ := stbl.Stts.GetDecodeTime(uint32(sampleNr))
-	var cto int32 = 0
-	if stbl.Ctts != nil {
-		cto = stbl.Ctts.GetCompositionTimeOffset(uint32(sampleNr))
-	}
+	pts := getSampleTime(stbl, sampleNr)
 	// Next find sample bytes as slice in mdat
 	offsetInMdatData := uint64(offset) - mdatPayloadStart
 	sample := mdat.Data[offsetInMdatData : offsetInMdatData+uint64(size)]
@@ -185,7 +185,7 @@ func replaceNALUnitData(parsedFile *mp4.File, stbl *mp4.StblBox, sampleNr int, r
 			}
 			ppsMap[uint32(pps.PicParameterSetID)] = pps
 		}
-		err = printAVCNalus(avcSPS, nalus, sampleNr, decTime+uint64(cto))
+		err = printAVCNalus(avcSPS, nalus, sampleNr, pts)
 
 		nullifyIDR(nalus, mdat, offsetInMdatData, spsMap, ppsMap)
 
@@ -197,6 +197,15 @@ func replaceNALUnitData(parsedFile *mp4.File, stbl *mp4.StblBox, sampleNr int, r
 	}
 
 	return nil
+}
+
+func getSampleTime(stbl *mp4.StblBox, sampleNr int) uint64 {
+	decTime, _ := stbl.Stts.GetDecodeTime(uint32(sampleNr))
+	var cto int32 = 0
+	if stbl.Ctts != nil {
+		cto = stbl.Ctts.GetCompositionTimeOffset(uint32(sampleNr))
+	}
+	return decTime + uint64(cto)
 }
 
 func nullifyIDR(nalus [][]byte, mdat *mp4.MdatBox, offsetInMdat uint64,
@@ -224,8 +233,91 @@ func nullifyIDR(nalus [][]byte, mdat *mp4.MdatBox, offsetInMdat uint64,
 			// 	panic(err)
 			// }
 			// fmt.Printf("Slice %#v\n", sliceHeader)
+		} else if nType == avc.NALU_SEI {
+			rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+			randomInt := rnd.Intn(11)
+			if randomInt > 2 {
+				fmt.Println("Nullifying SEI NALU")
+				nullSlice := make([]byte, sliceSize)
+				copy(mdat.Data[offsetInMdat:offsetInMdat+uint64(sliceSize-4)], nullSlice)
+			}
 		}
 	}
+}
+
+func processNonIDRFrame(parsedFile *mp4.File, stbl *mp4.StblBox, sampleNr int, rs io.ReadSeeker, timeScale float64) error {
+	var err error
+
+	mdat := parsedFile.Mdat
+	mdatPayloadStart := mdat.PayloadAbsoluteOffset()
+
+	// var avcSPS *avc.SPS
+	// var codec string
+
+	// if stbl.Stsd.AvcX != nil {
+	// 	codec = "avc"
+	// 	if stbl.Stsd.AvcX.AvcC != nil {
+	// 		avcSPS, err = avc.ParseSPSNALUnit(stbl.Stsd.AvcX.AvcC.SPSnalus[0], true)
+	// 		if err != nil {
+	// 			return fmt.Errorf("error parsing SPS: %s", err)
+	// 		}
+	// 	}
+	// } else if stbl.Stsd.HvcX != nil {
+	// 	codec = "hevc"
+	// }
+	// if codec != "avc" {
+	// 	return nil
+	// }
+
+	chunkNr, sampleNrAtChunkStart, err := stbl.Stsc.ChunkNrFromSampleNr(sampleNr)
+	if err != nil {
+		return err
+	}
+	offset := getChunkOffset(stbl, chunkNr)
+	for sNr := sampleNrAtChunkStart; sNr < sampleNr; sNr++ {
+		offset += int64(stbl.Stsz.GetSampleSize(sNr))
+	}
+	size := stbl.Stsz.GetSampleSize(sampleNr)
+	pts := getSampleTime(stbl, sampleNr)
+	timeInSecs := float64(pts) / timeScale
+
+	offsetInMdatData := uint64(offset) - mdatPayloadStart
+	sample := mdat.Data[offsetInMdatData : offsetInMdatData+uint64(size)]
+
+	nalus, err := avc.GetNalusFromSample(sample)
+	if err != nil {
+		return err
+	}
+
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	for _, nalu := range nalus {
+		var offsetInMdat uint64
+		naluType := avc.GetNaluType(nalu[0])
+		sliceSize := len(nalu) + 4
+
+		if naluType == avc.NALU_NON_IDR {
+			sliceType, _ := avc.GetSliceTypeFromNALU(nalu)
+
+			// Generate a random int between 0 and 10
+			randomInt := rnd.Intn(11)
+
+			// If the random int is more than x, nullify the frame
+			if randomInt > 0 {
+				fmt.Printf("Nullifying %s frame @ %.2f\n", sliceType, timeInSecs)
+				nullSlice := make([]byte, sliceSize)
+				copy(mdat.Data[offsetInMdat:offsetInMdat+uint64(sliceSize)], nullSlice)
+			} else {
+				fmt.Printf("%s frame pts: %.2f size: %d\n", sliceType, timeInSecs, len(nalu))
+			}
+			// Else do nothing
+		} else {
+			fmt.Println("Not a non-IDR frame but", naluType)
+		}
+		offsetInMdat += uint64(sliceSize)
+	}
+
+	return err
 }
 
 func printAVCNalus(avcSPS *avc.SPS, nalus [][]byte, nr int, pts uint64) error {
