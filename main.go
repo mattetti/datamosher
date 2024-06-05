@@ -48,28 +48,37 @@ func main() {
 
 			for i := 0; i < len(stbl.Stsz.SampleSize); i++ {
 				sampleNr := i + 1
-				if stbl.Stss != nil && stbl.Stss.IsSyncSample(uint32(sampleNr)) {
-					// This sample is an I-frame
-					decTime, _ := stbl.Stts.GetDecodeTime(uint32(sampleNr))
-					time := float64(decTime) / timeScale
-					iFrameTimes = append(iFrameTimes, time)
+				// IDR frame
+				if stbl.Stss != nil {
 
-					if firstIFrameFound {
-						// Replace I-frame NAL unit data with null bytes
-						replaceNALUnitData(parsedFile, stbl, sampleNr, inputFile)
-					} else {
-						firstIFrameFound = true
+					if stbl.Stss.IsSyncSample(uint32(sampleNr)) {
+						// get the frame time:
+						decTime, _ := stbl.Stts.GetDecodeTime(uint32(sampleNr))
+						var cto int32 = 0
+						if stbl.Ctts != nil {
+							cto = stbl.Ctts.GetCompositionTimeOffset(uint32(sampleNr))
+						}
+						time := float64(decTime+uint64(cto)) / timeScale
+						iFrameTimes = append(iFrameTimes, time)
+
+						if firstIFrameFound {
+							// Replace I-frame NAL unit data with null bytes
+							replaceNALUnitData(parsedFile, stbl, sampleNr, inputFile)
+						} else {
+							firstIFrameFound = true
+						}
 					}
+
 				}
 			}
 		}
 	}
 
 	// Print I-frame timings
-	fmt.Println("I-frame timings (in seconds):")
-	for _, time := range iFrameTimes {
-		fmt.Printf("%.3f\n", time)
-	}
+	// fmt.Println("I-frame timings (in seconds):")
+	// for _, time := range iFrameTimes {
+	// 	fmt.Printf("%.3f\n", time)
+	// }
 
 	// Rewrite the MP4 file (for simplicity, we write to a new file)
 	outputFileName := "output.mp4"
@@ -145,9 +154,11 @@ func replaceNALUnitData(parsedFile *mp4.File, stbl *mp4.StblBox, sampleNr int, r
 		return err
 	}
 
+	// offsets of the nalus in the sample data.
 	switch codec {
 	case "avc", "h.264", "h264":
 		if avcSPS == nil {
+			fmt.Println("No SPS found in the avcC box, trying to find it in the sample data")
 			for _, nalu := range nalus {
 				if avc.GetNaluType(nalu[0]) == avc.NALU_SPS {
 					avcSPS, err = avc.ParseSPSNALUnit(nalu, true)
@@ -158,11 +169,25 @@ func replaceNALUnitData(parsedFile *mp4.File, stbl *mp4.StblBox, sampleNr int, r
 			}
 		}
 
+		spsMap := make(map[uint32]*avc.SPS, 1)
+		for _, spsNalu := range stbl.Stsd.AvcX.AvcC.SPSnalus {
+			sps, err := avc.ParseSPSNALUnit(spsNalu, true)
+			if err != nil {
+				return fmt.Errorf("error parsing SPS: %s", err)
+			}
+			spsMap[uint32(sps.ParameterID)] = sps
+		}
+		ppsMap := make(map[uint32]*avc.PPS, 1)
+		for _, ppsNalu := range stbl.Stsd.AvcX.AvcC.PPSnalus {
+			pps, err := avc.ParsePPSNALUnit(ppsNalu, spsMap)
+			if err != nil {
+				return fmt.Errorf("error parsing PPS: %s", err)
+			}
+			ppsMap[uint32(pps.PicParameterSetID)] = pps
+		}
 		err = printAVCNalus(avcSPS, nalus, sampleNr, decTime+uint64(cto))
-		// TODO: Modify the NAL unit data here, nullify the i frame data.
-		// call GetSampleFromNalus(nalus) to get the new sample data
-		tempSlice := make([]byte, size)
-		copy(mdat.Data[offsetInMdatData+1:offsetInMdatData+uint64(size-1)], tempSlice)
+
+		nullifyIDR(nalus, mdat, offsetInMdatData, spsMap, ppsMap)
 
 	case "hevc", "h.265", "h265":
 		fmt.Println("HEVC not supported yet")
@@ -174,10 +199,42 @@ func replaceNALUnitData(parsedFile *mp4.File, stbl *mp4.StblBox, sampleNr int, r
 	return nil
 }
 
+func nullifyIDR(nalus [][]byte, mdat *mp4.MdatBox, offsetInMdat uint64,
+	spsMap map[uint32]*avc.SPS, ppsMap map[uint32]*avc.PPS) {
+	// Implement the nullifyIDR function here.
+	offset := 0
+	for _, nalu := range nalus {
+		sliceSize := len(nalu) + 4
+		nType := avc.GetNaluType(nalu[0])
+		fmt.Println("Nalu type:", nType)
+		if nType == avc.NALU_IDR {
+
+			// sliceHeader, err := avc.ParseSliceHeader(nalu, spsMap, ppsMap)
+			// if err != nil {
+			// 	panic(err)
+			// }
+			// fmt.Printf("Slice %#v\n", sliceHeader)
+			nullSlice := make([]byte, sliceSize)
+			naluOffsetInMdat := offsetInMdat + uint64(offset)
+			fmt.Println("Nullifying IDR NALU @", naluOffsetInMdat)
+			copy(mdat.Data[naluOffsetInMdat:offsetInMdat+uint64(sliceSize-4)], nullSlice)
+		} else if nType == avc.NALU_NON_IDR {
+			// sliceHeader, err := avc.ParseSliceHeader(nalu, spsMap, ppsMap)
+			// if err != nil {
+			// 	panic(err)
+			// }
+			// fmt.Printf("Slice %#v\n", sliceHeader)
+		}
+	}
+}
+
 func printAVCNalus(avcSPS *avc.SPS, nalus [][]byte, nr int, pts uint64) error {
 	msg := ""
 	totLen := 0
+	offsets := []int{}
+	offset := 0
 	for i, nalu := range nalus {
+		offsets = append(offsets, offset)
 		totLen += 4 + len(nalu)
 		if i > 0 {
 			msg += ","
@@ -200,8 +257,13 @@ func printAVCNalus(avcSPS *avc.SPS, nalus [][]byte, nr int, pts uint64) error {
 			//
 		}
 		msg += fmt.Sprintf(" %s %s(%dB)", naluType, imgType, len(nalu))
+		offset += 4 + len(nalu)
 	}
 	fmt.Printf("Sample %d, pts=%d (%dB):%s\n", nr, pts, totLen, msg)
+	for i, nalu := range nalus {
+		fmt.Printf("  NALU %d: %s - from %d to %d\n", i, avc.GetNaluType(nalu[0]),
+			offsets[i], offsets[i]+len(nalu)+4)
+	}
 	return nil
 }
 
