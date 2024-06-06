@@ -96,15 +96,15 @@ func processVideoTrack(parsedFile *mp4.File, track *mp4.TrakBox, inputFile *os.F
 			if stbl.Stss.IsSyncSample(uint32(sampleNr)) {
 				iFrameTimes = append(iFrameTimes, time)
 				if firstIFrameFound {
-					err := replaceNALUnitData(parsedFile, stbl, sampleNr, inputFile, config)
+					err := processFrame(parsedFile, stbl, sampleNr, inputFile, config, "I")
 					if err != nil {
-						fmt.Printf("Error replacing NAL unit data: %v\n", err)
+						fmt.Printf("Error processing I-frame: %v\n", err)
 					}
 				} else {
 					firstIFrameFound = true
 				}
 			} else if firstIFrameFound && time > 0.5 {
-				err := processNonIDRFrame(parsedFile, stbl, sampleNr, inputFile, timeScale, config)
+				err := processFrame(parsedFile, stbl, sampleNr, inputFile, config, "P")
 				if err != nil {
 					fmt.Printf("Error processing non-IDR frame: %v\n", err)
 				}
@@ -114,7 +114,7 @@ func processVideoTrack(parsedFile *mp4.File, track *mp4.TrakBox, inputFile *os.F
 	return iFrameTimes
 }
 
-func replaceNALUnitData(parsedFile *mp4.File, stbl *mp4.StblBox, sampleNr int, rs io.ReadSeeker, config DatamoshConfig) error {
+func processFrame(parsedFile *mp4.File, stbl *mp4.StblBox, sampleNr int, rs io.ReadSeeker, config DatamoshConfig, frameType string) error {
 	mdat := parsedFile.Mdat
 	mdatPayloadStart := mdat.PayloadAbsoluteOffset()
 	var avcSPS *avc.SPS
@@ -171,7 +171,7 @@ func replaceNALUnitData(parsedFile *mp4.File, stbl *mp4.StblBox, sampleNr int, r
 		if err != nil {
 			return err
 		}
-		nullifyIDR(nalus, mdat, offsetInMdatData, config, spsMap, ppsMap)
+		applyDatamosh(nalus, mdat, offsetInMdatData, config, frameType, spsMap, ppsMap)
 
 	case "hevc", "h.265", "h265":
 		return errors.New("HEVC not supported yet")
@@ -211,75 +211,37 @@ func getSampleTime(stbl *mp4.StblBox, sampleNr int) uint64 {
 	return decTime + uint64(cto)
 }
 
-func nullifyIDR(nalus [][]byte, mdat *mp4.MdatBox, offsetInMdat uint64, config DatamoshConfig, spsMap map[uint32]*avc.SPS, ppsMap map[uint32]*avc.PPS) {
+func applyDatamosh(nalus [][]byte, mdat *mp4.MdatBox, offsetInMdat uint64, config DatamoshConfig, frameType string, spsMap map[uint32]*avc.SPS, ppsMap map[uint32]*avc.PPS) {
 	offset := 0
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+
 	for _, nalu := range nalus {
-		rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
 		randomF := rnd.Float32()
 		sliceSize := len(nalu)
 		nType := avc.GetNaluType(nalu[0])
-		if nType == avc.NALU_IDR {
-			if randomF < config.DropIFramePercent {
-				nullSlice := make([]byte, sliceSize)
-				naluOffsetInMdat := offsetInMdat + uint64(offset)
-				copy(mdat.Data[naluOffsetInMdat+4:offsetInMdat+uint64(len(nullSlice))], nullSlice)
-			}
-		} else if nType == avc.NALU_SEI {
-			if randomF < config.DropSEIPercent {
-				nullSlice := make([]byte, sliceSize-4)
-				copy(mdat.Data[offsetInMdat+4:offsetInMdat+uint64(len(nullSlice))], nullSlice)
-			}
+		percentLimit := getFrameDropPercent(config, nType, frameType)
+
+		if randomF < percentLimit {
+			nullSlice := make([]byte, sliceSize)
+			naluOffsetInMdat := offsetInMdat + uint64(offset)
+			copy(mdat.Data[naluOffsetInMdat+4:offsetInMdat+uint64(len(nullSlice))], nullSlice)
 		}
 		offset += sliceSize
 	}
 }
 
-func processNonIDRFrame(parsedFile *mp4.File, stbl *mp4.StblBox, sampleNr int, rs io.ReadSeeker, timeScale float64, config DatamoshConfig) error {
-	mdat := parsedFile.Mdat
-	mdatPayloadStart := mdat.PayloadAbsoluteOffset()
-	chunkNr, sampleNrAtChunkStart, err := stbl.Stsc.ChunkNrFromSampleNr(sampleNr)
-	if err != nil {
-		return err
-	}
-	offset := getChunkOffset(stbl, chunkNr)
-	for sNr := sampleNrAtChunkStart; sNr < sampleNr; sNr++ {
-		offset += int64(stbl.Stsz.GetSampleSize(sNr))
-	}
-	size := stbl.Stsz.GetSampleSize(sampleNr)
-	pts := getSampleTime(stbl, sampleNr)
-	timeInSecs := float64(pts) / timeScale
-	offsetInMdatData := uint64(offset) - mdatPayloadStart
-	sample := mdat.Data[offsetInMdatData : offsetInMdatData+uint64(size)]
-
-	nalus, err := avc.GetNalusFromSample(sample)
-	if err != nil {
-		return err
-	}
-
-	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
-	offsetInMdat := offsetInMdatData
-	for _, nalu := range nalus {
-		naluType := avc.GetNaluType(nalu[0])
-		sliceSize := len(nalu)
-		if naluType == avc.NALU_NON_IDR {
-			sliceType, _ := avc.GetSliceTypeFromNALU(nalu)
-			randomF := rnd.Float32()
-			percentLimit := config.DropBFramePercent
-			if sliceType == avc.SLICE_P {
-				percentLimit = config.DropPFramePercent
-			}
-			if randomF < percentLimit {
-				fmt.Printf("Nullifying %s frame @ %.2f\n", sliceType, timeInSecs)
-				nullSlice := make([]byte, sliceSize)
-				copy(mdat.Data[offsetInMdat+4:offsetInMdat+uint64(len(nullSlice))], nullSlice)
-			} else {
-				fmt.Printf("%s frame pts: %.2f size: %d\n", sliceType, timeInSecs, len(nalu))
-			}
+func getFrameDropPercent(config DatamoshConfig, nType avc.NaluType, frameType string) float32 {
+	switch nType {
+	case avc.NALU_IDR:
+		return config.DropIFramePercent
+	case avc.NALU_SEI:
+		return config.DropSEIPercent
+	default:
+		if frameType == "P" {
+			return config.DropPFramePercent
 		}
-		offsetInMdat += uint64(sliceSize)
+		return config.DropBFramePercent
 	}
-
-	return nil
 }
 
 func printAVCNalus(avcSPS *avc.SPS, nalus [][]byte, nr int, pts uint64) error {
